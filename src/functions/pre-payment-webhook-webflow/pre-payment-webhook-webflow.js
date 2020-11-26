@@ -1,5 +1,7 @@
 const Webflow = require("webflow-api");
 
+let weblowApi;
+
 /**
  * Returns custom Options set as environment variables.
  *
@@ -29,9 +31,9 @@ function customOptions() {
  */
 function getMessages() {
   return {
-    categoryMismatch: process.env['FX_ERROR_CATEGORY_MISMATCH'] ? process.env['FX_ERROR_CATEGORY_MISMATCH'] : 'Mismatched category.',
-    insufficientInventory: process.env['FX_ERROR_INSUFFICIENT_INVENTORY'] ? process.env['FX_ERROR_INSUFFICIENT_INVENTORY'] : 'Insufficient inventory for these items:',
-    priceMismatch: process.env['FX_ERROR_PRICE_MISMATCH'] ? process.env['FX_ERROR_PRICE_MISMATCH'] : 'Prices do not match.',
+    categoryMismatch: process.env['FX_ERROR_CATEGORY_MISMATCH'] || 'Mismatched category.',
+    insufficientInventory: process.env['FX_ERROR_INSUFFICIENT_INVENTORY'] || 'Insufficient inventory for these items:',
+    priceMismatch: process.env['FX_ERROR_PRICE_MISMATCH'] || 'Prices do not match.',
   }
 }
 
@@ -93,11 +95,7 @@ async function handleRequest(event, context, callback) {
       });
     }
   }).catch((e) => {
-    if (e.code && e.code.toString() === '429') {
-      console.log('Error: Webflow rate limit reached.')
-    } else {
-      console.log('Error', e.code, e.message);
-    }
+    console.log(e);
     callback(null, {
       body: JSON.stringify({ details: "An internal error has occurred", ok: false, }),
       statusCode: 500,
@@ -210,10 +208,25 @@ function extractItems(body) {
  * @returns {boolean} valid
  */
 function validItem(item) {
-  return item.price
-    && item.quantity
-    && item.code
-    && getOption(item, 'collection_id').value;
+  const errors = [];
+  if (!(item.price || parseInt(item.price, 10) === 0)) {
+    errors.push(`${item.name} has no price.`)
+  }
+  if (!(item.quantity || parseInt(item.quantity, 10) === 0)) {
+    errors.push(`${item.name} has no quantity.`)
+  }
+  if (!(item.code || parseInt(item.code, 10) === 0)) {
+    errors.push(`${item.name} has no code.`)
+  }
+  const collection = getOption(item, 'collection_id').value;
+  if (!collection) {
+    errors.push(`${item.name} has no collection_id.`)
+  }
+  if (errors.length) {
+    console.log("Invalid item ", item.name, errors.join(' '));
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -274,11 +287,6 @@ function isPriceCorrect(comparable) {
 function correctCategory(comparable) {
   const wfItem = comparable.wfItem;
   const fxItem = comparable.fxItem;
-  if (!fxItem) {
-    // an item with no matched item is not to be checked
-    return true;
-  }
-  // if no category is found in the collection item, ignore it
   const category = getCustomizableOption(wfItem, 'category');
   const categoryExists = !!Object.keys(category).length;
   if (!categoryExists) return true;
@@ -299,15 +307,12 @@ function correctCategory(comparable) {
 function sufficientInventory(comparable) {
   const wfItem = comparable.wfItem;
   const fxItem = comparable.fxItem;
-  if (!fxItem) {
-    return true;
-  }
   const field = getCustomKey('inventory');
   if (field.toLowerCase() === "null" || field.toLowerCase() === "false") {
     // The webhook is configured not to check the inventory: ignore
     return true;
   }
-  if (customOptions().skip.inventory.indexOf(getCustomizableOption(wfItem, 'code')) >= 0) {
+  if (customOptions().skip.inventory.indexOf(getCustomizableOption(wfItem, 'code').value) >= 0) {
     // The code is set to be ignored: ignore
     return true;
   }
@@ -334,7 +339,10 @@ function getToken() {
  * @returns {Webflow} the webflow api object
  */
 function getWebflow() {
-  return new Webflow({ token: getToken() });
+  if (!weblowApi) {
+    weblowApi = new Webflow({ token: getToken() });
+  }
+  return weblowApi;
 }
 
 /**
@@ -365,11 +373,14 @@ function enrichFetchedItem(webflowItem, foxyItem) {
  * @returns {Promise<{object}>} a promise for the item from Webflow
  */
 function fetchItem(cache, foxyItem, offset = 0) {
-  if (offset > 1000) {
+  if (offset > 500) {
+    console.log("   ... giving up.");
     return Promise.reject(new Error('Item not found'));
   }
+  if (offset) {
+    console.log("   ... couldn't find the item in first", offset, "items.");
+  }
   const collectionId = getCustomizableOption(foxyItem, 'collection_id').value;
-
   const webflow = getWebflow();
   const found = cache.findItem(collectionId, foxyItem);
   if (found) {
@@ -377,39 +388,39 @@ function fetchItem(cache, foxyItem, offset = 0) {
   }
   return new Promise((resolve, reject) => {
     webflow.items(
-      { collectionId },
-      { sort: [getCustomKey('code'), 'ASC'], limit: customOptions().webflow.limit, offset },
+      { collectionId }, { limit: customOptions().webflow.limit, offset, sort: [getCustomKey('code'), 'ASC'] },
     ).then((collection) => {
       cache.addItems(collectionId, collection.items);
       let code_exists = null;
       const match = collection.items.find(
         (e) => {
           const wfItemCode = iGet(e, getCustomKey('code'));
-          if (!wfItemCode) {
+          if (wfItemCode === undefined) {
             if (code_exists === null) {
               code_exists = false;
             }
             return false;
           }
           code_exists = true;
-          return wfItemCode && foxyItem.code && wfItemCode.toString() === foxyItem.code.toString()
+          return foxyItem.code && wfItemCode.toString() === foxyItem.code.toString()
         }
       );
       if (code_exists === false) {
         reject(new Error(`Could not find the code field (${getCustomKey('code')}) in Webflow.
               this field must exist and not be empty for all items in the collection.`));
-        return;
-      }
-      if (match) {
-        resolve(enrichFetchedItem(match, foxyItem));
-      } else if (collection.total > collection.offset + collection.count) {
-        fetchItem(cache, foxyItem, ((offset / customOptions().webflow.limit) + 1) * customOptions().webflow.limit)
-          .then((i) => resolve(i))
-          .catch((e) => reject(e));
       } else {
-        reject(new Error('Item not found'));
+        if (match) {
+          resolve(enrichFetchedItem(match, foxyItem));
+        } else if (collection.total > collection.offset + collection.count) {
+          fetchItem(cache, foxyItem, ((offset / customOptions().webflow.limit) + 1) * customOptions().webflow.limit)
+            .then((i) => resolve(i))
+            .catch((e) => {console.log(e); reject(e);});
+        } else {
+          reject(new Error('Item not found'));
+        }
       }
     }).catch((e) => {
+      console.log(e);
       reject(e);
     });
   });
