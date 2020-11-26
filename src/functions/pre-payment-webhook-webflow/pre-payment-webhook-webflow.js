@@ -178,9 +178,9 @@ function createCache() {
       }
       return this.cache[collection].find(
         (e) => {
-            const itemCode = iGet(item, 'code');
+            const itemCode = item.code;
             const wfCode = getCustomizableOption(e, 'code').value;
-            return itemCode && wfCode && wfCode.toString() === itemCode.toString();
+            return itemCode && wfCode && wfCode.toString().trim() === itemCode.toString().trim();
         },
       );
     },
@@ -308,6 +308,9 @@ function sufficientInventory(comparable) {
   const wfItem = comparable.wfItem;
   const fxItem = comparable.fxItem;
   const field = getCustomKey('inventory');
+  if (Number(fxItem.quantity) === 0) {
+    return true;
+  }
   if (field.toLowerCase() === "null" || field.toLowerCase() === "false") {
     // The webhook is configured not to check the inventory: ignore
     return true;
@@ -319,9 +322,16 @@ function sufficientInventory(comparable) {
   const inventoryField = Object.keys(wfItem).find(k => k.toLowerCase().trim() === field.toLowerCase().trim())
   if (inventoryField === undefined) {
     // The Webflow collection does not have the proper inventory field: ignore
+    console.log(`Warning: the inventory field (${inventoryField}) does not exist in this webflow collection. Skipping inventory check.`);
     return true;
   }
-  return Number(wfItem[inventoryField]) >= Number(fxItem.quantity);
+  const fxQuantity = Number(fxItem.quantity);
+  const wfInventory = Number(wfItem[inventoryField]);
+  if (isNaN(fxQuantity) || isNaN(wfInventory)) {
+    console.log(`Warning: a value for quantity or inventory is not a number: quantity ${fxQuantity} ; inventory: ${wfInventory}`)
+    return true;
+  }
+  return wfInventory >= fxQuantity;
 }
 
 /**
